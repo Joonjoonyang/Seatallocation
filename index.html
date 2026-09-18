@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>학생 좌석 월별 자동배정</title>
+<style>
+  *{box-sizing:border-box}
+  body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f5f7fb;color:#202733}
+  .wrap{max-width:1100px;margin:0 auto;padding:24px}
+  h1{margin:0 0 18px;font-size:28px}
+  .panel{background:#fff;border:1px solid #dfe4ec;border-radius:14px;padding:18px;margin-bottom:18px;box-shadow:0 2px 8px rgba(0,0,0,.04)}
+  .inputs{display:flex;flex-wrap:wrap;gap:12px;align-items:end}
+  label{display:flex;flex-direction:column;gap:6px;font-weight:700;font-size:14px}
+  input{width:130px;padding:10px 12px;border:1px solid #cbd3df;border-radius:9px;font-size:16px}
+  button{border:0;border-radius:9px;padding:10px 16px;font-size:15px;font-weight:700;cursor:pointer}
+  .primary{background:#222;color:#fff}
+  .danger{background:#eee;color:#b00020}
+  .hint{margin:12px 0 0;color:#596579;font-size:14px}
+  .prompt{padding:14px 16px;border-radius:12px;background:#eef4ff;border:1px solid #c9dafd;margin:14px 0;font-weight:700}
+  .month-card{background:#fff;border:1px solid #dfe4ec;border-radius:14px;padding:18px;margin:18px 0;box-shadow:0 2px 8px rgba(0,0,0,.04)}
+  .month-title{font-size:21px;font-weight:800;margin-bottom:14px}
+  .classroom{display:flex;gap:18px;align-items:flex-start;overflow-x:auto;padding:8px 2px 14px}
+  .block{min-width:150px;border:2px solid #cfd7e4;border-radius:12px;padding:10px;background:#fafbfe}
+  .block-title{text-align:center;font-weight:800;margin-bottom:9px}
+  .seat{height:48px;border:1px solid #cfd5df;border-radius:8px;background:#fff;margin:7px 0;display:flex;align-items:center;justify-content:center;font-weight:800;position:relative;overflow:hidden}
+  .seat.hidden{display:none !important}
+  .seat.revealed{display:flex !important;animation:pop .35s ease}
+  .seat.dup{border:2px solid #d33;background:#fff3f3}
+  .dupmark{position:absolute;right:5px;top:3px;font-size:10px;color:#c00;font-weight:900}
+  @keyframes pop{from{opacity:.1;transform:scale(.95)}to{opacity:1;transform:scale(1)}}
+  .small{font-size:13px;color:#687386}
+  .finish{font-weight:800;padding:12px 0}
+  .history-table{border-collapse:collapse;margin-top:12px;width:100%}
+  .history-table th,.history-table td{border:1px solid #d7dce5;padding:7px;text-align:center}
+  .history-table th{background:#f3f5f8}
+  @media(max-width:650px){.wrap{padding:12px}.inputs{align-items:stretch}.inputs label{width:100%}input{width:100%}.block{min-width:125px}}
+  @media print{.panel,.prompt,.controls{display:none!important}.month-card{break-inside:avoid;box-shadow:none}.seat.hidden{visibility:visible}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="panel controls">
+    <h1>학생 좌석 월별 자동배정</h1>
+    <div class="inputs">
+      <label>학생 수<input id="n" type="number" min="1" max="300" value="30"></label>
+      <label>개월 수<input id="m" type="number" min="1" max="12" value="12"></label>
+      <label>분단 수<input id="b" type="number" min="1" max="30" value="6"></label>
+      <button id="start" class="primary">배정 시작</button>
+      <button id="reset" class="danger" style="display:none">초기화</button>
+    </div>
+    <div class="hint">같은 학생은 같은 (분단 X, 자리 Y)를 다시 배정받지 않도록 합니다. 불가피한 중복은 빨간색으로 표시합니다.</div>
+  </div>
+  <div id="app"></div>
+</div>
+
+<script>
+(() => {
+  const KEY = "student_seat_monthly_v5";
+  let S = {n:0,m:0,b:0,months:[],nextMonth:0,busy:false};
+  const $ = id => document.getElementById(id);
+  const app = $("app");
+
+  function save(){
+    const copy = {...S, busy:false};
+    localStorage.setItem(KEY, JSON.stringify(copy));
+  }
+  function load(){
+    try{
+      const x = JSON.parse(localStorage.getItem(KEY) || "null");
+      if(x && x.n && x.m && x.b && Array.isArray(x.months)){
+        S = {...S,...x,busy:false};
+        return true;
+      }
+    }catch(e){}
+    return false;
+  }
+
+  function makeSeats(n,b){
+    const base=Math.floor(n/b), rem=n%b, seats=[];
+    for(let x=1;x<=b;x++){
+      const cnt=base+(x<=rem?1:0);
+      for(let y=1;y<=cnt;y++) seats.push({x,y,key:x+"-"+y});
+    }
+    return seats;
+  }
+
+  // 각 학생별 과거 좌석을 피하면서, 이번 달 좌석은 모든 학생에게 정확히 한 자리씩 배정.
+  // 재사용이 필요하면 중복 수가 가장 적은 해를 찾습니다.
+  function makeMonth(n,b,history){
+    const seats=makeSeats(n,b);
+    const prev=history.map(month => month.assignment);
+    const used=Array.from({length:n},()=>new Set());
+    for(const month of history){
+      month.assignment.forEach((s,i)=>used[i].add(s.key));
+    }
+
+    // 랜덤화된 반복 시도. 보통 n>=2이면 월별 중복 없이 쉽게 해를 찾습니다.
+    let best=null, bestDup=Infinity;
+    const attempts=Math.min(5000, Math.max(500,n*80));
+
+    for(let attempt=0;attempt<attempts;attempt++){
+      const order=[...Array(n).keys()].sort(()=>Math.random()-0.5);
+      const remaining=[...seats].sort(()=>Math.random()-0.5);
+      const result=Array(n);
+      let dup=0;
+      let failed=false;
+
+      // 제약이 많은 학생(과거 사용좌석이 많은 학생)을 먼저 처리
+      order.sort((a,c)=>used[c].size-used[a].size || Math.random()-.5);
+
+      for(const i of order){
+        let choices=remaining.filter(s=>!used[i].has(s.key));
+        if(choices.length===0){
+          // 불가피한 경우 남은 좌석 중 하나를 선택
+          choices=remaining;
+          dup++;
+        }
+        const seat=choices[Math.floor(Math.random()*choices.length)];
+        result[i]=seat;
+        const idx=remaining.findIndex(s=>s.key===seat.key);
+        remaining.splice(idx,1);
+      }
+
+      if(dup<bestDup){
+        bestDup=dup;
+        best=result;
+        if(dup===0) break;
+      }
+      if(failed) break;
+    }
+
+    return {
+      assignment:best.map((seat,i)=>({
+        student:i+1,x:seat.x,y:seat.y,key:seat.key,
+        dup:used[i].has(seat.key)
+      })),
+      dupCount:best.filter((seat,i)=>used[i].has(seat.key)).length
+    };
+  }
+
+  function clearPrompt(){
+    document.querySelectorAll(".prompt").forEach(el=>el.remove());
+  }
+
+  function addPrompt(){
+    clearPrompt();
+    if(S.nextMonth >= S.m){
+      addFinish();
+      return;
+    }
+    const p=document.createElement("div");
+    p.className="prompt";
+    p.id="currentPrompt";
+    p.innerHTML=`${S.nextMonth+1}개월차 좌석을 선정할 준비가 되었습니다.<br><span class="small">스페이스바 또는 Enter를 누르면 5그룹으로 3초 간격 공개됩니다.</span>`;
+    app.appendChild(p);
+  }
+
+  function createMonthCard(monthIndex, data, revealAll=false){
+    const card=document.createElement("div");
+    card.className="month-card";
+    card.dataset.month=monthIndex+1;
+    const title=document.createElement("div");
+    title.className="month-title";
+    title.textContent=`${monthIndex+1}개월차`;
+    card.appendChild(title);
+
+    const classroom=document.createElement("div");
+    classroom.className="classroom";
+    const seats=makeSeats(S.n,S.b);
+
+    for(let x=1;x<=S.b;x++){
+      const block=document.createElement("div");
+      block.className="block";
+      const bt=document.createElement("div");
+      bt.className="block-title";
+      bt.textContent=`${x}분단`;
+      block.appendChild(bt);
+
+      const inBlock=seats.filter(s=>s.x===x);
+      for(const seat of inBlock){
+        const a=data.assignment.find(v=>v.x===seat.x && v.y===seat.y);
+        const el=document.createElement("div");
+        el.className="seat "+(revealAll||a ? "revealed" : "hidden")+(a?.dup?" dup":"");
+        if(revealAll && a) el.style.display="flex";
+        el.dataset.student=a?.student || "";
+        el.dataset.key=seat.key;
+        el.textContent=a ? `학생 ${a.student}` : "";
+        if(a?.dup){
+          const mark=document.createElement("span");
+          mark.className="dupmark";
+          mark.textContent="중복";
+          el.appendChild(mark);
+        }
+        block.appendChild(el);
+      }
+      classroom.appendChild(block);
+    }
+    card.appendChild(classroom);
+    const info=document.createElement("div");
+    info.className="small";
+    info.textContent=`중복 좌석: ${data.dupCount}건`;
+    card.appendChild(info);
+    app.appendChild(card);
+    return card;
+  }
+
+  function revealCurrent(){
+    if(S.busy || S.nextMonth>=S.m) return;
+
+    S.busy=true;
+    clearPrompt();
+
+    const monthIndex=S.nextMonth;
+    const data=makeMonth(S.n,S.b,S.months);
+    const card=createMonthCard(monthIndex,data,false);
+
+    // createMonthCard에서 모든 좌석은 display:none으로 시작합니다.
+    const seatByStudent=new Map();
+    card.querySelectorAll(".seat").forEach(el=>{
+      const student=Number(el.dataset.student);
+      if(student){
+        // CSS에 의존하지 않고 JS에서도 확실하게 숨깁니다.
+        el.style.display="none";
+        seatByStudent.set(student,el);
+      }
+    });
+
+    // 학생 번호를 무작위 순서로 섞습니다.
+    const students=data.assignment.map(a=>a.student);
+    for(let i=students.length-1;i>0;i--){
+      const j=Math.floor(Math.random()*(i+1));
+      [students[i],students[j]]=[students[j],students[i]];
+    }
+
+    // 5개 그룹으로 분할: 30명이라면 6명씩.
+    const groups=Array.from({length:5},()=>[]);
+    students.forEach((student,i)=>groups[i%5].push(student));
+
+    let groupIndex=0;
+
+    function showNextGroup(){
+      const group=groups[groupIndex];
+
+      group.forEach(student=>{
+        const el=seatByStudent.get(student);
+        if(el){
+          el.style.display="flex";
+          el.classList.remove("hidden");
+          el.classList.add("revealed");
+        }
+      });
+
+      groupIndex++;
+
+      if(groupIndex<5){
+        window.setTimeout(showNextGroup,3000);
+      }else{
+        // 마지막 그룹 공개 직후에만 저장합니다.
+        S.months.push(data);
+        S.nextMonth=monthIndex+1;
+        S.busy=false;
+        save();
+
+        if(S.nextMonth<S.m) addPrompt();
+        else addFinish();
+      }
+    }
+
+    // 첫 번째 6명은 즉시 공개.
+    showNextGroup();
+  }
+
+  function renderSaved(){
+    app.innerHTML="";
+    $("start").style.display="none";
+    $("reset").style.display="inline-block";
+
+    S.months.forEach((data,i)=>createMonthCard(i,data,true));
+
+    if(S.nextMonth<S.m) addPrompt();
+    else addFinish();
+  }
+
+  function addFinish(){
+    if(document.getElementById("finishPanel")) return;
+    const p=document.createElement("div");
+    p.id="finishPanel";
+    p.className="panel";
+    p.innerHTML=`<div class="finish">모든 월의 좌석 선정이 완료되었습니다.</div>
+      <button id="showHistory" class="primary">학생별 좌석 이력 보기</button>
+      <button id="printBtn">인쇄</button>
+      <div id="historyBox"></div>`;
+    app.appendChild(p);
+    document.getElementById("showHistory").onclick=showHistory;
+    document.getElementById("printBtn").onclick=()=>window.print();
+  }
+
+  function showHistory(){
+    const box=document.getElementById("historyBox");
+    if(box.innerHTML){box.innerHTML="";return;}
+    let h="<table class='history-table'><tr><th>학생</th>";
+    for(let m=0;m<S.m;m++) h+=`<th>${m+1}개월</th>`;
+    h+="</tr>";
+    for(let st=1;st<=S.n;st++){
+      h+=`<tr><th>${st}</th>`;
+      for(let m=0;m<S.months.length;m++){
+        const a=S.months[m].assignment.find(x=>x.student===st);
+        h+=`<td>${a?`(${a.x}, ${a.y})${a.dup?" *":""}`:"-"}</td>`;
+      }
+      h+="</tr>";
+    }
+    h+="</table><div class='small'>* 중복 좌석</div>";
+    box.innerHTML=h;
+  }
+
+  function start(){
+    const n=Number($("n").value), m=Number($("m").value), b=Number($("b").value);
+    if(!Number.isInteger(n)||n<1){alert("학생 수를 확인해 주세요.");return;}
+    if(!Number.isInteger(m)||m<1||m>12){alert("개월 수는 1~12개월로 입력해 주세요.");return;}
+    if(!Number.isInteger(b)||b<1||b>n){alert("분단 수는 1 이상, 학생 수 이하로 입력해 주세요.");return;}
+
+    S={n,m,b,months:[],nextMonth:0,busy:false};
+    save();
+    $("start").style.display="none";
+    $("reset").style.display="inline-block";
+    app.innerHTML="";
+    addPrompt();
+  }
+
+  function resetAll(){
+    if(!confirm("저장된 좌석 배정과 진행 상태를 모두 삭제하고 처음부터 시작하시겠습니까?")) return;
+    localStorage.removeItem(KEY);
+    S={n:0,m:0,b:0,months:[],nextMonth:0,busy:false};
+    app.innerHTML="";
+    $("start").style.display="inline-block";
+    $("reset").style.display="none";
+  }
+
+  $("start").onclick=start;
+  $("reset").onclick=resetAll;
+
+  document.addEventListener("keydown",e=>{
+    if((e.key===" "||e.key==="Enter") && !S.busy){
+      const tag=document.activeElement?.tagName;
+      if(tag==="INPUT"||tag==="TEXTAREA"||tag==="SELECT") return;
+      if(S.n && S.nextMonth<S.m){
+        e.preventDefault();
+        revealCurrent();
+      }
+    }
+  });
+
+  // 브라우저를 닫았다 다시 열어도 완료된 월까지 복원
+  if(load()){
+    $("n").value=S.n;
+    $("m").value=S.m;
+    $("b").value=S.b;
+    renderSaved();
+  }
+})();
+</script>
+</body>
+</html>
